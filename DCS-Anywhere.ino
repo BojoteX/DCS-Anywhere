@@ -48,7 +48,7 @@ void setup() {
 void loop() {
     // ---- USB handshake: do not change ----
     if (!mainLoopStarted) {
-        dcsSendCommand("STARTING HANDSHAKE\r\n");
+        dcsSendCommand("STARTING HANDSHAKE\n");
         mainLoopStarted = true;
     }
 
@@ -58,7 +58,7 @@ void loop() {
     // Example periodic DCS-BIOS command + status log
     if (millis() - lastSend > 5000) {
         lastSend = millis();
-        const char* cmd = "UFC_1 1\r\n";
+        const char* cmd = "UFC_1 1\n";
         dcsSendCommand(cmd);
         logDebugf("[DCSBIOS] Aircraft Name: %s\n", aircraftName);
     }
