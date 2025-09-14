@@ -1,8 +1,17 @@
 # --- main.py --- 
 import sys, re, os, configparser
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(SCRIPT_DIR, "settings.ini")
+LOCKFILE = os.path.join(SCRIPT_DIR, "cockpitos_dashboard.lock")
+DEFAULT_REPORT_SIZE = 64
+DEFAULT_MULTICAST_IP = "239.255.50.10"
+DEFAULT_UDP_PORT = 5010
+HANDSHAKE_REQ = b"DCSBIOS-HANDSHAKE"
+FEATURE_REPORT_ID = 0
+IDLE_TIMEOUT = 2.0
+MAX_DEVICES = 20
 
 def ini_console_enabled(path=SETTINGS_PATH):
     try:
@@ -13,7 +22,7 @@ def ini_console_enabled(path=SETTINGS_PATH):
             return v in ('1','true','yes','on','y')
     except Exception:
         pass
-    return False
+    return True
 
 HEADLESS   = ('--console' in sys.argv) or ('--headless' in sys.argv) or ini_console_enabled()
 IS_WINDOWS = (os.name == 'nt') or sys.platform.startswith('win')
@@ -32,6 +41,8 @@ for mod, pip_name in REQUIRED_MODULES.items():
     except ImportError:
         missing.append(pip_name if pip_name else mod)
 
+import os
+
 if missing:
     # Build a clean pip install line (skip stdlib names like 'tkinter'/'curses' when pip_name is None)
     to_pip = [m for m in missing if m not in ("tkinter", "curses")]
@@ -41,51 +52,47 @@ if missing:
     if to_pip:
         msg += f"\nTo install the missing Python modules, run:\n\n    pip install {' '.join(to_pip)}\n"
     msg += "\nAfter installing, restart this program."
-    if HEADLESS:
+
+    # HEADLESS mode or no display (no X server)
+    is_headless = HEADLESS or not os.environ.get("DISPLAY")
+    if is_headless:
         print(msg)
     else:
-        import tkinter as tk
-        from tkinter import scrolledtext as ST
-        root = tk.Tk(); root.title("Missing Required Modules"); root.geometry("560x320"); root.resizable(False, False)
-        lbl = tk.Label(root, text="Missing required modules for CockpitController HID Handler:",
-                       font=("Arial", 12, "bold"), pady=10); lbl.pack()
-        text = ST.ScrolledText(root, width=68, height=10, font=("Consolas", 10))
-        text.pack(padx=12, pady=(0,10)); text.insert("1.0", msg); text.config(state='normal'); text.focus()
-        tk.Button(root, text="Close", command=root.destroy, width=18).pack(pady=10)
-        root.protocol("WM_DELETE_WINDOW", root.destroy); root.mainloop()
+        try:
+            import tkinter as tk
+            from tkinter import scrolledtext as ST
+            root = tk.Tk(); root.title("Missing Required Modules"); root.geometry("560x320"); root.resizable(False, False)
+            lbl = tk.Label(root, text="Missing required modules for CockpitController HID Handler:",
+                           font=("Arial", 12, "bold"), pady=10); lbl.pack()
+            text = ST.ScrolledText(root, width=68, height=10, font=("Consolas", 10))
+            text.pack(padx=12, pady=(0,10)); text.insert("1.0", msg); text.config(state='normal'); text.focus()
+            tk.Button(root, text="Close", command=root.destroy, width=18).pack(pady=10)
+            root.protocol("WM_DELETE_WINDOW", root.destroy); root.mainloop()
+        except Exception:
+            # fallback: print to CLI if Tk fails (e.g., no display)
+            print(msg)
+    input("Press Enter to exit...")
     sys.exit(1)
 
 from filelock import FileLock, Timeout
-
-LOCKFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cockpitos_dashboard.lock")
 
 try:
     lock = FileLock(LOCKFILE + ".lock")
     lock.acquire(timeout=0.1)
 except Timeout:
     print("ERROR: Another instance of CockpitController HID Handler is already running.")
+    input("Press Enter to exit...")
     sys.exit(1)
 
 # Import tkinter only if GUI mode
 if not HEADLESS:
     import tkinter as tk
 
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
-
 # --- config.py ---
 import configparser
 import time
 import threading
 import ipaddress
-
-DEFAULT_REPORT_SIZE = 64
-DEFAULT_MULTICAST_IP = "239.255.50.10"
-DEFAULT_UDP_PORT = 5010
-HANDSHAKE_REQ = b"DCSBIOS-HANDSHAKE"
-FEATURE_REPORT_ID = 0
-IDLE_TIMEOUT = 2.0
-MAX_DEVICES = 20
-LOCKFILE = "cockpitos_dashboard.lock"
 
 def is_bt_serial(s: str) -> bool:
     # MAC forms: AA:BB:CC:DD:EE:FF or AA-BB-CC-DD-EE-FF, plain 12-hex, or your BX-<16hex>
@@ -95,20 +102,28 @@ def is_bt_serial(s: str) -> bool:
 def read_settings_from_ini(filename="settings.ini"):
     config = configparser.ConfigParser()
     if not os.path.isfile(filename):
-        config['USB'] = {'VID': '0xCAFE', 'PID': '0xCAF3'}
+        config['USB'] = {'VID': '0xCAFE'}  # PID omitted by default
         config['DCS'] = {'UDP_SOURCE_IP': '127.0.0.1'}
+        config['MAIN'] = {'CONSOLE': '1'}
         with open(filename, 'w') as configfile:
             config.write(configfile)
     config.read(filename)
+
     try:
         vid = int(config['USB']['VID'], 0)
-        pid = int(config['USB']['PID'], 0)
     except Exception:
-        vid, pid = 0xCAFE, 0xCAF3
+        vid = 0xCAFE
+
+    try:
+        pid = int(config['USB'].get('PID', ''), 0)
+    except Exception:
+        pid = None
+
     try:
         dcs_ip = config['DCS'].get('UDP_SOURCE_IP', '127.0.0.1')
     except Exception:
         dcs_ip = '127.0.0.1'
+
     return vid, pid, dcs_ip
 
 def write_settings_dcs_ip(new_ip, filename="settings.ini"):
@@ -152,7 +167,14 @@ import hid
 import time
 
 def list_target_devices():
-    return [d for d in hid.enumerate() if d['vendor_id'] == USB_VID and d['product_id'] == USB_PID]
+    devices = []
+    for d in hid.enumerate():
+        if d['vendor_id'] != USB_VID:
+            continue
+        if USB_PID and d['product_id'] != USB_PID:
+            continue
+        devices.append(d)
+    return devices
 
 def try_fifo_handshake(dev, uiq=None, device_name=None):
     payload = HANDSHAKE_REQ.ljust(DEFAULT_REPORT_SIZE, b'\x00')
@@ -403,7 +425,7 @@ class NetworkManager:
             self.udp_rx_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
             while self._running.is_set():
-                data, addr = self.udp_rx_sock.recvfrom(4096)
+                data, addr = self.udp_rx_sock.recvfrom(16384)
 
                 # learn data source once
                 if (not self._ip_committed and addr and is_valid_ipv4(addr[0])
@@ -734,7 +756,7 @@ if HEADLESS:
             hdr = f"Frames: {self._stats['frames']}   Hz: {self._stats['hz']}   kB/s: {self._stats['bw']}   " \
                   f"Avg UDP Frame size (Bytes): {self._stats['avgudp']}   Data Source: {self._stats['src']}"
             stdscr.addnstr(0, 0, hdr, w-1, curses.A_BOLD)
-            stdscr.addnstr(2, 0, "Devices", w-1, curses.A_UNDERLINE)
+            # stdscr.addnstr(2, 0, "Devices", w-1, curses.A_UNDERLINE)
             stdscr.addnstr(3, 0, f"{'Device':<38} {'Status':<16} {'Reconnections':<14}", w-1)
             y = 4
             for name, status, reconn in self._rows:
@@ -746,7 +768,7 @@ if HEADLESS:
                 stdscr.addnstr(y, 0, f"{name:<38} {status:<16} {reconn:<14}", w-1, attr)
                 y += 1
             y += 1
-            stdscr.addnstr(y, 0, "Event Log:", w-1, curses.A_UNDERLINE)
+            # stdscr.addnstr(y, 0, "Event Log:", w-1, curses.A_UNDERLINE)
             y += 1
             avail = max(0, h - y - 1)
             tail = self._log[-avail:] if avail else []
@@ -775,6 +797,7 @@ if HEADLESS:
         def run(self):
             if curses is None:
                 print("Missing console backend: install with: pip install windows-curses")
+                input("Press Enter to exit...")
                 sys.exit(1)
             curses.wrapper(self._loop)
 
@@ -783,6 +806,7 @@ if HEADLESS:
     def start_console_mode():
         if curses is None:
             print("Missing console backend: install with: pip install windows-curses")
+            input("Press Enter to exit...")
             sys.exit(1)
 
         def holder_devices():
@@ -863,15 +887,27 @@ else:
     def start_console_mode():
         print("Console mode not enabled. Run with --console or --headless.")
 
-# --- main.py (continued) ---
+# --- main.py ---
 def main():
-    if ('--console' in sys.argv) or ('--headless' in sys.argv) or ini_console_enabled():
+    # Auto-detect headless if no DISPLAY, even if not passed on CLI
+    no_display = not os.environ.get("DISPLAY")
+    force_console = ('--console' in sys.argv) or ('--headless' in sys.argv) or ini_console_enabled() or no_display
+
+    if force_console:
         start_console_mode()
         lock.release()
         return
 
-    # GUI mode (original)
-    root = tk.Tk()
+    # GUI mode (only if X11 display is available)
+    try:
+        root = tk.Tk()
+    except Exception as e:
+        print(f"GUI cannot be started: {e}")
+        print("Falling back to console mode...")
+        start_console_mode()
+        lock.release()
+        return
+
     gui = CockpitGUI(root, None)
     net = NetworkManager(gui.uiq, reply_addr, gui.get_devices)
     gui.network_mgr = net
