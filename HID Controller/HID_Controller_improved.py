@@ -2204,7 +2204,7 @@ def main() -> None:
 
     try:
         # Load settings (lazy initialization)
-        vid, pid, dcs_ip = get_settings()
+        vid, pid, dcs_ip, _ = get_settings()  # report_id used via get_report_id()
 
         print("CockpitOS HID Bridge - Production Edition v3")
         print(f"VID: 0x{vid:04X}, PID: {'Any' if pid is None else f'0x{pid:04X}'}")
