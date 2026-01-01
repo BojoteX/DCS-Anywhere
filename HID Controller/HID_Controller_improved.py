@@ -461,6 +461,11 @@ def get_logger() -> logging.Logger:
 _debug_log_times: Dict[str, float] = {}
 _debug_log_lock = threading.Lock()
 
+# UI queue full warning throttle
+_ui_queue_full_last_warn: float = 0.0
+_ui_queue_full_count: int = 0
+UI_QUEUE_FULL_WARN_INTERVAL_S = 10.0  # Warn every 10 seconds max
+
 
 def log_event(uiq: Optional[queue.Queue], name: str, msg: str, level: str = "info") -> None:
     """
@@ -476,6 +481,8 @@ def log_event(uiq: Optional[queue.Queue], name: str, msg: str, level: str = "inf
         Debug-level messages are rate-limited per device to prevent log flooding
         when many devices are failing. See DEBUG_LOG_INTERVAL_S constant.
     """
+    global _ui_queue_full_last_warn, _ui_queue_full_count
+
     # Rate-limit debug messages per device
     if level == "debug" and DEBUG_LOG_INTERVAL_S > 0:
         now = time.monotonic()
@@ -493,7 +500,13 @@ def log_event(uiq: Optional[queue.Queue], name: str, msg: str, level: str = "inf
             uiq.put_nowait(('log', name, msg))
         except queue.Full:
             # UI queue full - log continues to file, UI display dropped
-            pass
+            # Periodically warn about suppressed UI logs
+            _ui_queue_full_count += 1
+            now = time.monotonic()
+            if now - _ui_queue_full_last_warn >= UI_QUEUE_FULL_WARN_INTERVAL_S:
+                logger.warning(f"UI queue full; {_ui_queue_full_count} log(s) not displayed in UI")
+                _ui_queue_full_last_warn = now
+                _ui_queue_full_count = 0
 
 def read_settings() -> Tuple[int, Optional[int], str, int]:
     """
@@ -2142,6 +2155,8 @@ class CockpitHidBridge:
             log_event(self.ui_queue, 'System',
                 f'Pi tuning: poll={RX_POLL_INTERVAL_MS}ms, stagger={HANDSHAKE_STAGGER_MS}ms, '
                 f'all-or-nothing={TX_ALL_OR_NOTHING}')
+            log_event(self.ui_queue, 'System',
+                f'Device limit: {MAX_DEVICES} (Pi USB bandwidth/power constraint)')
 
         # Log USB diagnostics on Linux
         log_usb_diagnostics(self.ui_queue)
