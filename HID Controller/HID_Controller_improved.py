@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CockpitOS HID Manager - Refactored for Scale (v2, improved logging)
+CockpitOS HID Manager - Refactored for Scale (v3, production-hardened)
 Handles 200+ devices with fixed thread pool (O(1) threads, not O(N))
 
 Features:
@@ -9,6 +9,9 @@ Features:
 - Professional curses-based console UI
 - Cross-platform (Windows, Linux, macOS)
 - File/stdout logging with backpressure warnings
+- Retry logic with exponential backoff for transient failures
+- Thread-safe statistics collection
+- Fully importable as a library (no module-level side effects)
 
 Author: CockpitOS Project
 License: MIT
@@ -18,9 +21,10 @@ License: MIT
 # IMPORTS AND BOOTSTRAP
 # ══════════════════════════════════════════════════════════════════════════════
 
+from __future__ import annotations
+
 import sys
 import os
-import re
 import time
 import socket
 import struct
@@ -30,12 +34,12 @@ import configparser
 import ipaddress
 import logging
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional, List, Dict, Callable, Tuple, Any
+from typing import Optional, List, Dict, Callable, Tuple, Any, Deque
 
-# Change to script directory
+# Script directory - computed but NOT changed at import time
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-os.chdir(SCRIPT_DIR)
 
 # Platform detection
 IS_WINDOWS = (os.name == 'nt') or sys.platform.startswith('win')
@@ -79,13 +83,39 @@ from filelock import FileLock, Timeout
 # ══════════════════════════════════════════════════════════════════════════════
 
 LOCKFILE = os.path.join(SCRIPT_DIR, "hid_manager.lock")
-try:
-    lock = FileLock(LOCKFILE)
-    lock.acquire(timeout=0.1)
-except Timeout:
-    print("ERROR: Another instance of CockpitOS HID Manager is already running.")
-    input("Press Enter to exit...")
-    sys.exit(1)
+
+# Global lock reference - acquired in main(), not at import time
+_instance_lock: Optional[FileLock] = None
+
+
+def acquire_instance_lock() -> FileLock:
+    """
+    Acquire single-instance lock. Call this in main(), not at import time.
+    Returns the lock object (caller must release on exit).
+    Raises SystemExit if another instance is running.
+    """
+    global _instance_lock
+    try:
+        _instance_lock = FileLock(LOCKFILE)
+        _instance_lock.acquire(timeout=0.1)
+        return _instance_lock
+    except Timeout:
+        print("ERROR: Another instance of CockpitOS HID Manager is already running.")
+        input("Press Enter to exit...")
+        sys.exit(1)
+
+
+def release_instance_lock() -> None:
+    """Release the single-instance lock if held."""
+    global _instance_lock
+    if _instance_lock is not None:
+        try:
+            _instance_lock.release()
+        except Exception:
+            # Suppress all errors during cleanup - lock may already be released
+            # or file may be inaccessible. Logging here could cause recursion issues.
+            pass
+        _instance_lock = None
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION CONSTANTS
@@ -112,13 +142,45 @@ LOG_STDOUT             = True    # Also log to stdout/stderr (in addition to UI)
 HANDSHAKE_QUEUE_WARN   = 6       # Warn if more than this many pending handshakes
 TX_DROP_LOG_INTERVAL_S = 5.0     # Throttle log spam for TX drops
 
+# Device open retry configuration
+DEVICE_OPEN_MAX_RETRIES = 3      # Max retry attempts for device open
+DEVICE_OPEN_BASE_DELAY  = 0.5    # Base delay for exponential backoff (seconds)
+DEVICE_OPEN_MAX_DELAY   = 4.0    # Maximum delay between retries (seconds)
+
+# Thread shutdown timeouts
+THREAD_JOIN_TIMEOUT     = 2.0    # Timeout for thread joins (seconds)
+THREAD_JOIN_WARN        = True   # Log warning if thread doesn't join in time
+
 # UI refresh
 UI_REFRESH_MS          = 50      # Console refresh interval
 
-def extract_feature_payload(resp: List[int]) -> bytes:
-    """Normalize HID feature report payload (strip report ID when present)."""
+# Maximum expected HID report size (for validation)
+MAX_HID_REPORT_SIZE    = 256     # Reasonable upper bound for validation
+
+
+def extract_feature_payload(resp: List[int], expected_size: int = DEFAULT_REPORT_SIZE) -> bytes:
+    """
+    Normalize HID feature report payload (strip report ID when present).
+
+    Args:
+        resp: Raw HID response as list of integers
+        expected_size: Expected payload size for validation
+
+    Returns:
+        Extracted payload as bytes, empty bytes if invalid
+    """
     if not resp:
         return b""
+
+    # Validate response is within reasonable bounds
+    if len(resp) > MAX_HID_REPORT_SIZE:
+        # Truncate to maximum expected size to prevent memory issues
+        resp = resp[:MAX_HID_REPORT_SIZE]
+
+    # Validate all values are valid bytes (0-255)
+    if not all(isinstance(b, int) and 0 <= b <= 255 for b in resp):
+        return b""
+
     if resp[0] == FEATURE_REPORT_ID:
         return bytes(resp[1:])
     return bytes(resp)
@@ -129,37 +191,67 @@ def extract_feature_payload(resp: List[int]) -> bytes:
 
 SETTINGS_PATH = os.path.join(SCRIPT_DIR, "settings.ini")
 
-def setup_logging() -> logging.Logger:
-    """Configure file + optional stdout logging."""
-    logger = logging.getLogger("cockpitos_hid")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
+# Logger instance - lazily initialized to avoid module-level side effects
+_logger: Optional[logging.Logger] = None
+_logger_lock = threading.Lock()
 
-    formatter = logging.Formatter(
-        fmt="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
 
-    if not logger.handlers:
-        file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+def get_logger() -> logging.Logger:
+    """
+    Get or create the application logger (lazy initialization).
+    Thread-safe singleton pattern.
+    """
+    global _logger
+    if _logger is not None:
+        return _logger
 
-        if LOG_STDOUT:
-            stream_handler = logging.StreamHandler(stream=sys.stdout)
-            stream_handler.setFormatter(formatter)
-            logger.addHandler(stream_handler)
+    with _logger_lock:
+        # Double-check after acquiring lock
+        if _logger is not None:
+            return _logger
 
-    return logger
+        logger = logging.getLogger("cockpitos_hid")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
 
-LOGGER = setup_logging()
+        formatter = logging.Formatter(
+            fmt="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
 
-def log_event(uiq: queue.Queue, name: str, msg: str, level: str = "info"):
-    """Log to file/console and enqueue for UI display."""
-    log_fn = getattr(LOGGER, level, LOGGER.info)
+        if not logger.handlers:
+            file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+
+            if LOG_STDOUT:
+                stream_handler = logging.StreamHandler(stream=sys.stdout)
+                stream_handler.setFormatter(formatter)
+                logger.addHandler(stream_handler)
+
+        _logger = logger
+        return _logger
+
+
+def log_event(uiq: Optional[queue.Queue], name: str, msg: str, level: str = "info") -> None:
+    """
+    Log to file/console and enqueue for UI display.
+
+    Args:
+        uiq: UI queue for display (can be None to skip UI)
+        name: Component/device name for log prefix
+        msg: Log message
+        level: Log level ('debug', 'info', 'warning', 'error', 'critical')
+    """
+    logger = get_logger()
+    log_fn = getattr(logger, level, logger.info)
     log_fn(f"[{name}] {msg}")
     if uiq is not None:
-        uiq.put(('log', name, msg))
+        try:
+            uiq.put_nowait(('log', name, msg))
+        except queue.Full:
+            # UI queue full - log continues to file, UI display dropped
+            pass
 
 def read_settings() -> Tuple[int, Optional[int], str]:
     """Read VID, PID, and DCS IP from settings.ini"""
@@ -200,9 +292,19 @@ def write_dcs_ip(ip: str):
         config.write(f)
 
 def is_valid_ipv4(ip: str) -> bool:
-    """Validate IPv4 address (non-multicast, non-unspecified)"""
+    """
+    Validate IPv4 address for use as DCS target.
+
+    Args:
+        ip: IP address string to validate
+
+    Returns:
+        True if valid unicast IPv4 address, False otherwise
+    """
+    if not ip or not isinstance(ip, str):
+        return False
     try:
-        ip_obj = ipaddress.ip_address(ip)
+        ip_obj = ipaddress.ip_address(ip.strip())
         return (
             isinstance(ip_obj, ipaddress.IPv4Address)
             and not ip_obj.is_multicast
@@ -211,11 +313,45 @@ def is_valid_ipv4(ip: str) -> bool:
     except ValueError:
         return False
 
-# Load settings
-USB_VID, USB_PID, STORED_DCS_IP = read_settings()
-if not is_valid_ipv4(STORED_DCS_IP):
-    LOGGER.warning("Invalid DCS IP in settings.ini: %s (ignoring)", STORED_DCS_IP)
-    STORED_DCS_IP = None
+
+# Settings cache - loaded lazily on first access
+_settings_cache: Optional[Tuple[int, Optional[int], Optional[str]]] = None
+_settings_lock = threading.Lock()
+
+
+def get_settings() -> Tuple[int, Optional[int], Optional[str]]:
+    """
+    Get cached settings (lazy load on first access).
+    Thread-safe singleton pattern.
+
+    Returns:
+        Tuple of (VID, PID, DCS_IP) where PID and DCS_IP may be None
+    """
+    global _settings_cache
+    if _settings_cache is not None:
+        return _settings_cache
+
+    with _settings_lock:
+        if _settings_cache is not None:
+            return _settings_cache
+
+        vid, pid, dcs_ip = read_settings()
+
+        # Validate DCS IP
+        if dcs_ip and not is_valid_ipv4(dcs_ip):
+            get_logger().warning("Invalid DCS IP in settings.ini: %s (ignoring)", dcs_ip)
+            dcs_ip = None
+
+        _settings_cache = (vid, pid, dcs_ip)
+        return _settings_cache
+
+
+def reload_settings() -> Tuple[int, Optional[int], Optional[str]]:
+    """Force reload settings from disk. Returns new settings."""
+    global _settings_cache
+    with _settings_lock:
+        _settings_cache = None
+    return get_settings()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DEVICE STATE
@@ -514,11 +650,14 @@ class TxDispatcher:
             
             self.worker_busy[worker_id] = False
     
-    def stop(self):
+    def stop(self) -> None:
+        """Stop all TX workers with proper timeout handling."""
         self._running.clear()
         for t in self.workers:
-            t.join(timeout=1.0)
-    
+            t.join(timeout=THREAD_JOIN_TIMEOUT)
+            if t.is_alive() and THREAD_JOIN_WARN:
+                log_event(None, "TxDispatcher", f"Worker {t.name} did not stop within timeout", "warning")
+
     def get_queue_depth(self) -> int:
         """Returns max queue depth across all workers."""
         return max(wq.qsize() for wq in self.worker_queues) if self.worker_queues else 0
@@ -531,30 +670,58 @@ class RxPoller:
     """
     Polls assigned devices for incoming data using non-blocking reads.
     One poller handles a subset of devices (round-robin assignment).
+
+    The callback is set via set_command_callback() to avoid initialization
+    order issues (callback target may not exist at construction time).
     """
-    
+
     def __init__(self, poller_id: int, registry: DeviceRegistry,
-                 ui_queue: queue.Queue,
-                 on_command: Callable[[str], None]):
+                 ui_queue: queue.Queue):
         self.poller_id = poller_id
         self.registry = registry
         self.uiq = ui_queue
-        self.on_command = on_command
-        
+
+        # Callback is set after construction via set_command_callback()
+        # This avoids the lambda placeholder pattern and initialization gaps
+        self._on_command: Optional[Callable[[str], None]] = None
+        self._callback_lock = threading.Lock()
+
         self._running = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.is_busy = False
-    
-    def start(self):
+
+    def set_command_callback(self, callback: Callable[[str], None]) -> None:
+        """
+        Set the callback for sending commands to DCS.
+        Thread-safe - can be called before or after start().
+        """
+        with self._callback_lock:
+            self._on_command = callback
+
+    def _send_command(self, cmd: str) -> bool:
+        """
+        Send command via callback if available.
+        Returns True if sent, False if no callback configured.
+        """
+        with self._callback_lock:
+            if self._on_command is not None:
+                self._on_command(cmd)
+                return True
+        return False
+
+    def start(self) -> None:
         self._running.set()
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.name = f"RxPoller-{self.poller_id}"
         self._thread.start()
-    
-    def stop(self):
+
+    def stop(self) -> None:
+        """Stop the poller with proper timeout handling."""
         self._running.clear()
         if self._thread:
-            self._thread.join(timeout=1.0)
+            self._thread.join(timeout=THREAD_JOIN_TIMEOUT)
+            if self._thread.is_alive() and THREAD_JOIN_WARN:
+                log_event(None, "RxPoller", f"Poller {self.poller_id} did not stop within timeout", "warning")
     
     def _poll_loop(self):
         """
@@ -597,8 +764,11 @@ class RxPoller:
                     
                     # OUTSIDE LOCK: Send to network and UI (no contention risk)
                     for msg in messages_to_send:
-                        self.on_command(msg + "\n")
-                        log_event(self.uiq, dev_state.name, f"IN: {msg}")
+                        if self._send_command(msg + "\n"):
+                            log_event(self.uiq, dev_state.name, f"IN: {msg}")
+                        else:
+                            # Callback not yet configured - log but don't lose the message
+                            log_event(self.uiq, dev_state.name, f"IN (no callback): {msg}", "warning")
                     
                 except Exception as e:
                     dev_state.set_state(DeviceState.ERROR, "RX ERROR")
@@ -611,39 +781,47 @@ class RxPoller:
         """
         Read ALL pending Feature Reports. MUST be called with dev_state.lock held.
         Returns list of command strings to send (processed outside lock).
+
+        Note: Logging is done at debug level inside the loop since HID errors
+        during drain are expected (indicates buffer is empty).
         """
         MAX_DRAIN_ITERATIONS = 64
         drained_count = 0
-        messages = []
-        
-        for _ in range(MAX_DRAIN_ITERATIONS):
+        messages: List[str] = []
+
+        for iteration in range(MAX_DRAIN_ITERATIONS):
             try:
                 resp = dev_state.dev.get_feature_report(
                     FEATURE_REPORT_ID,
                     DEFAULT_REPORT_SIZE + 1
                 )
                 payload = extract_feature_payload(resp)
-                
+
                 if not any(payload):
                     break
-                
+
                 msg = payload.rstrip(b'\x00').decode(errors='replace').strip()
-                
+
                 if not msg:
                     continue
-                
+
                 if msg == HANDSHAKE_REQ.decode():
                     continue
-                
+
                 # Collect message (will be sent outside lock)
                 messages.append(msg)
                 dev_state.packets_rx += 1
                 dev_state.mark_activity()
                 drained_count += 1
-                
-            except Exception:
+
+            except Exception as e:
+                # Expected when buffer is empty or device disconnects during drain
+                # Log at debug level to avoid noise during normal operation
+                if drained_count == 0 and iteration == 0:
+                    # Only log if we didn't get any messages - might indicate issue
+                    log_event(self.uiq, dev_state.name, f"Drain interrupted: {e}", "debug")
                 break
-        
+
         if drained_count >= MAX_DRAIN_ITERATIONS:
             log_event(
                 self.uiq,
@@ -651,7 +829,7 @@ class RxPoller:
                 f"WARNING: Drain hit safety cap ({MAX_DRAIN_ITERATIONS})",
                 "warning",
             )
-        
+
         return messages
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -676,18 +854,21 @@ class HandshakeManager:
         self._running = threading.Event()
         self._thread: Optional[threading.Thread] = None
     
-    def start(self):
+    def start(self) -> None:
         self._running.set()
         self._thread = threading.Thread(target=self._handshake_loop, daemon=True)
         self._thread.name = "HandshakeMgr"
         self._thread.start()
-    
-    def stop(self):
+
+    def stop(self) -> None:
+        """Stop the handshake manager with proper timeout handling."""
         self._running.clear()
         if self._thread:
-            self._thread.join(timeout=2.0)
-    
-    def enqueue(self, dev_state: DeviceState):
+            self._thread.join(timeout=THREAD_JOIN_TIMEOUT)
+            if self._thread.is_alive() and THREAD_JOIN_WARN:
+                log_event(None, "HandshakeMgr", "Handshake manager did not stop within timeout", "warning")
+
+    def enqueue(self, dev_state: DeviceState) -> None:
         self.pending.put(dev_state)
         if self.pending.qsize() > HANDSHAKE_QUEUE_WARN:
             log_event(
@@ -747,38 +928,49 @@ class HandshakeManager:
         """
         Clear any stale Feature Report data after handshake.
         Lock protects HID operations for cross-platform safety.
+
+        Returns:
+            True if backlog cleared successfully, False on error or timeout.
         """
         dev = dev_state.dev
         max_attempts = 100
-        
+
         for attempt in range(max_attempts):
             if not self._running.is_set():
                 return False
-            
+
             try:
                 with dev_state.lock:
                     resp = dev.get_feature_report(FEATURE_REPORT_ID, DEFAULT_REPORT_SIZE + 1)
                     payload = extract_feature_payload(resp)
-                    
+
                     # Empty buffer = all zeros
                     if not any(payload):
                         return True
-                    
-            except Exception:
+
+            except Exception as e:
+                log_event(self.uiq, dev_state.name, f"Backlog clear error: {e}", "debug")
                 return False
-        
+
         # Timeout - buffer never cleared
+        log_event(self.uiq, dev_state.name, f"Backlog clear timeout after {max_attempts} attempts", "warning")
         return False
-    
+
     def _do_handshake(self, dev_state: DeviceState) -> bool:
-        """Perform FIFO handshake sequence. Lock protects HID operations."""
+        """
+        Perform FIFO handshake sequence. Lock protects HID operations.
+
+        Returns:
+            True if handshake completed successfully, False on timeout or error.
+        """
         dev = dev_state.dev
         payload = HANDSHAKE_REQ.ljust(DEFAULT_REPORT_SIZE, b'\x00')
-        
+        last_error: Optional[Exception] = None
+
         for attempt in range(50):  # Max ~10 seconds
             if not self._running.is_set():
                 return False
-            
+
             try:
                 with dev_state.lock:
                     # Check if device already echoed handshake
@@ -786,21 +978,26 @@ class HandshakeManager:
                     data = extract_feature_payload(resp)
                     if data.rstrip(b'\x00') == HANDSHAKE_REQ:
                         return True
-                    
+
                     # Send handshake request
                     dev.send_feature_report(bytes([FEATURE_REPORT_ID]) + payload)
-                    
+
                     # Check response
                     resp = dev.get_feature_report(FEATURE_REPORT_ID, DEFAULT_REPORT_SIZE + 1)
                     data = extract_feature_payload(resp)
                     if data.rstrip(b'\x00') == HANDSHAKE_REQ:
                         return True
-                
-            except Exception:
-                pass
-            
+
+            except Exception as e:
+                last_error = e
+                # Log at debug level - transient errors are expected during handshake
+                log_event(self.uiq, dev_state.name, f"Handshake attempt {attempt+1} error: {e}", "debug")
+
             time.sleep(0.2)
-        
+
+        # Log final error if we exhausted attempts
+        if last_error:
+            log_event(self.uiq, dev_state.name, f"Handshake failed after 50 attempts, last error: {last_error}", "error")
         return False
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -808,8 +1005,15 @@ class HandshakeManager:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HotplugMonitor:
-    """Monitors for USB device connect/disconnect events."""
-    
+    """
+    Monitors for USB device connect/disconnect events.
+
+    Features:
+    - Periodic scanning for device changes
+    - Exponential backoff retry for device open failures
+    - Reconnection tracking and logging
+    """
+
     def __init__(self, vid: int, pid: Optional[int],
                  registry: DeviceRegistry,
                  handshake_mgr: HandshakeManager,
@@ -821,20 +1025,26 @@ class HotplugMonitor:
         self.handshake_mgr = handshake_mgr
         self.uiq = ui_queue
         self.reconnection_tracker = reconnection_tracker
-        
+
+        # Track devices that failed to open (for retry backoff)
+        self._failed_devices: Dict[str, Tuple[float, int]] = {}  # key -> (next_retry_time, attempt_count)
+
         self._running = threading.Event()
         self._thread: Optional[threading.Thread] = None
-    
-    def start(self):
+
+    def start(self) -> None:
         self._running.set()
         self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._thread.name = "HotplugMon"
         self._thread.start()
-    
-    def stop(self):
+
+    def stop(self) -> None:
+        """Stop the hotplug monitor with proper timeout handling."""
         self._running.clear()
         if self._thread:
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=THREAD_JOIN_TIMEOUT)
+            if self._thread.is_alive() and THREAD_JOIN_WARN:
+                log_event(None, "HotplugMon", "Hotplug monitor did not stop within timeout", "warning")
     
     def _monitor_loop(self):
         while self._running.is_set():
@@ -870,24 +1080,70 @@ class HotplugMonitor:
             if existing is None:
                 self._handle_connect(info)
     
-    def _handle_connect(self, info: dict):
+    def _handle_connect(self, info: dict) -> None:
+        """
+        Handle a newly detected device connection.
+
+        Implements exponential backoff retry for transient USB errors.
+        """
         key = info.get('serial_number', '') or str(info.get('path', b''))
 
         if self.registry.count() >= MAX_DEVICES:
             log_event(self.uiq, 'Hotplug', f"Device limit reached ({MAX_DEVICES}); ignoring {key}", "warning")
             return
-        
+
+        # Check if we're in backoff period for this device
+        now = time.monotonic()
+        if key in self._failed_devices:
+            next_retry, attempt_count = self._failed_devices[key]
+            if now < next_retry:
+                # Still in backoff period - skip this attempt
+                return
+
+        # Attempt to open device
+        dev: Optional[hid.device] = None
         try:
             dev = hid.device()
             dev.open_path(info['path'])
+            # Success - clear any failure tracking
+            if key in self._failed_devices:
+                del self._failed_devices[key]
         except Exception as e:
-            log_event(self.uiq, 'Hotplug', f"Failed to open device: {e}", "error")
+            # Track failure and schedule retry with exponential backoff
+            if key in self._failed_devices:
+                _, attempt_count = self._failed_devices[key]
+                attempt_count += 1
+            else:
+                attempt_count = 1
+
+            if attempt_count <= DEVICE_OPEN_MAX_RETRIES:
+                # Calculate exponential backoff delay
+                delay = min(
+                    DEVICE_OPEN_BASE_DELAY * (2 ** (attempt_count - 1)),
+                    DEVICE_OPEN_MAX_DELAY
+                )
+                self._failed_devices[key] = (now + delay, attempt_count)
+                log_event(
+                    self.uiq, 'Hotplug',
+                    f"Failed to open device (attempt {attempt_count}/{DEVICE_OPEN_MAX_RETRIES}): {e}. "
+                    f"Retrying in {delay:.1f}s",
+                    "warning"
+                )
+            else:
+                # Max retries exceeded - log error and stop trying
+                log_event(
+                    self.uiq, 'Hotplug',
+                    f"Failed to open device after {DEVICE_OPEN_MAX_RETRIES} attempts: {e}. Giving up.",
+                    "error"
+                )
+                # Keep in failed_devices with very long delay to prevent spam
+                self._failed_devices[key] = (now + 60.0, attempt_count)
             return
-        
+
         dev_state = DeviceState(dev, info)
         dev_state.reconnections = self.reconnection_tracker.get(key, 0)
         self.reconnection_tracker[key] = dev_state.reconnections + 1
-        
+
         if self.registry.add(dev_state):
             # First connect shows "Connected", subsequent show reconnect count
             if dev_state.reconnections == 0:
@@ -897,15 +1153,23 @@ class HotplugMonitor:
             self.uiq.put(('status', dev_state.name, None))
             self.handshake_mgr.enqueue(dev_state)
     
-    def _handle_disconnect(self, dev_state: DeviceState):
+    def _handle_disconnect(self, dev_state: DeviceState) -> None:
+        """Handle device disconnection - clean up resources and notify."""
         self.registry.remove(dev_state)
         dev_state.set_state(DeviceState.DISCONNECTED)
-        
+
+        # Clean up HID handle
         try:
             dev_state.dev.close()
-        except Exception:
-            pass
-        
+        except Exception as e:
+            # Log at debug - device may already be gone
+            log_event(self.uiq, dev_state.name, f"Close during disconnect: {e}", "debug")
+
+        # Clear from failed devices tracker if present
+        key = dev_state.serial or str(dev_state.path)
+        if key in self._failed_devices:
+            del self._failed_devices[key]
+
         log_event(self.uiq, dev_state.name, "Disconnected")
         self.uiq.put(('status', dev_state.name, None))
 
@@ -914,97 +1178,118 @@ class HotplugMonitor:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class UdpNetwork:
-    """Handles UDP multicast RX (from DCS) and unicast TX (to DCS)."""
-    
-    def __init__(self, tx_dispatcher: TxDispatcher, ui_queue: queue.Queue):
+    """
+    Handles UDP multicast RX (from DCS) and unicast TX (to DCS).
+
+    Features:
+    - Thread-safe statistics collection
+    - Automatic DCS IP discovery from first packet
+    - Multicast group membership management
+    """
+
+    def __init__(self, tx_dispatcher: TxDispatcher, ui_queue: queue.Queue,
+                 initial_dcs_ip: Optional[str] = None):
         self.tx_dispatcher = tx_dispatcher
         self.uiq = ui_queue
-        
-        self.reply_addr: Optional[str] = STORED_DCS_IP
+
+        self.reply_addr: Optional[str] = initial_dcs_ip
         self.rx_sock: Optional[socket.socket] = None
         self.tx_sock: Optional[socket.socket] = None
-        
+
         self._running = threading.Event()
         self._rx_thread: Optional[threading.Thread] = None
         self._ip_committed = False
-        
-        # Stats
-        self.frames_total = 0
-        self.frames_window = 0
-        self.bytes_window = 0
-        self.window_start = time.monotonic()
-    
-    def start(self):
+
+        # Thread-safe stats using a lock
+        self._stats_lock = threading.Lock()
+        self._frames_total = 0
+        self._frames_window = 0
+        self._bytes_window = 0
+        self._window_start = time.monotonic()
+
+    def start(self) -> None:
         self._running.set()
-        
+
         # TX socket
         self.tx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        
+
         # RX thread
         self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
         self._rx_thread.name = "UdpRx"
         self._rx_thread.start()
-    
-    def stop(self):
+
+    def stop(self) -> None:
+        """Stop the UDP network layer with proper cleanup."""
         self._running.clear()
-        
-        # Explicitly leave multicast group (platform-dependent but "flawless" cleanup)
+
+        # Explicitly leave multicast group (platform-dependent but proper cleanup)
         if self.rx_sock:
             try:
                 mreq = struct.pack("=4sl", socket.inet_aton(DEFAULT_MULTICAST_IP), socket.INADDR_ANY)
                 self.rx_sock.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
-            except Exception:
-                pass
-        
+            except Exception as e:
+                log_event(self.uiq, 'UDP', f"Multicast leave: {e}", "debug")
+
         # Close sockets
         for sock in (self.rx_sock, self.tx_sock):
             if sock:
                 try:
                     sock.close()
-                except Exception:
-                    pass
-        
-        # Join RX thread for deterministic shutdown (NASA-grade lifecycle)
+                except Exception as e:
+                    log_event(None, 'UDP', f"Socket close: {e}", "debug")
+
+        # Join RX thread for deterministic shutdown
         if self._rx_thread:
-            self._rx_thread.join(timeout=1.0)
+            self._rx_thread.join(timeout=THREAD_JOIN_TIMEOUT)
+            if self._rx_thread.is_alive() and THREAD_JOIN_WARN:
+                log_event(None, "UdpNetwork", "UDP RX thread did not stop within timeout", "warning")
     
-    def send_command(self, cmd: str):
+    def send_command(self, cmd: str) -> None:
         """Send ASCII command to DCS-BIOS."""
         if self.tx_sock and self.reply_addr:
             try:
                 self.tx_sock.sendto(cmd.encode(), (self.reply_addr, DEFAULT_DCS_TX_PORT))
             except Exception as e:
                 log_event(self.uiq, 'UDP', f"TX error: {e}", "error")
-    
-    def _rx_loop(self):
+
+    def _update_stats(self, data_len: int) -> None:
+        """Thread-safe stats update."""
+        with self._stats_lock:
+            self._frames_total += 1
+            self._frames_window += 1
+            self._bytes_window += data_len
+
+    def _rx_loop(self) -> None:
         """Receive UDP multicast from DCS-BIOS."""
         try:
             self.rx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.rx_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            
+
             try:
                 self.rx_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RX_BUFFER_SIZE)
-            except Exception:
-                pass
-            
+            except Exception as e:
+                log_event(self.uiq, 'UDP', f"Could not set receive buffer size: {e}", "debug")
+
             self.rx_sock.bind(('', DEFAULT_UDP_PORT))
-            
-            # CRITICAL: Set timeout for deterministic shutdown (NASA-grade requirement)
+
+            # CRITICAL: Set timeout for deterministic shutdown
             self.rx_sock.settimeout(0.5)
-            
+
             mreq = struct.pack("=4sl", socket.inet_aton(DEFAULT_MULTICAST_IP), socket.INADDR_ANY)
             self.rx_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-            
+
             log_event(self.uiq, 'UDP', f"Listening on {DEFAULT_MULTICAST_IP}:{DEFAULT_UDP_PORT}")
-            
+
             while self._running.is_set():
                 try:
-                    data, addr = self.rx_sock.recvfrom(4096)  # Match MAX_UDP_FRAME_SIZE
+                    data, addr = self.rx_sock.recvfrom(4096)
                 except socket.timeout:
                     continue
-                except OSError:
+                except OSError as e:
+                    if self._running.is_set():
+                        log_event(self.uiq, 'UDP', f"Socket error: {e}", "error")
                     break
-                
+
                 # Learn DCS address from first packet
                 if not self._ip_committed and addr and is_valid_ipv4(addr[0]):
                     if self.reply_addr != addr[0]:
@@ -1013,40 +1298,42 @@ class UdpNetwork:
                         self._ip_committed = True
                         self.uiq.put(('data_source', None, addr[0]))
                         log_event(self.uiq, 'UDP', f"DCS detected at {addr[0]}")
-                
-                # Stats
-                self.frames_total += 1
-                self.frames_window += 1
-                self.bytes_window += len(data)
-                
-                # Dispatch
+
+                # Thread-safe stats update
+                self._update_stats(len(data))
+
+                # Dispatch to HID devices
                 self.tx_dispatcher.dispatch(data)
-                
+
         except Exception as e:
             log_event(self.uiq, 'UDP', f"RX fatal error: {e}", "error")
-    
+
     def get_stats(self) -> Dict[str, Any]:
-        """Get current stats and reset window counters."""
-        now = time.monotonic()
-        duration = max(now - self.window_start, 0.001)
-        
-        hz = self.frames_window / duration
-        kbps = (self.bytes_window / 1024.0) / duration
-        avg_size = self.bytes_window / max(self.frames_window, 1)
-        
-        stats = {
-            'frames': self.frames_total,
-            'hz': f"{hz:.1f}",
-            'kbps': f"{kbps:.1f}",
-            'avg_size': f"{avg_size:.1f}",
-        }
-        
-        # Reset window
-        self.frames_window = 0
-        self.bytes_window = 0
-        self.window_start = now
-        
-        return stats
+        """
+        Get current stats and reset window counters.
+        Thread-safe - can be called from UI thread while RX thread updates stats.
+        """
+        with self._stats_lock:
+            now = time.monotonic()
+            duration = max(now - self._window_start, 0.001)
+
+            hz = self._frames_window / duration
+            kbps = (self._bytes_window / 1024.0) / duration
+            avg_size = self._bytes_window / max(self._frames_window, 1)
+
+            stats = {
+                'frames': self._frames_total,
+                'hz': f"{hz:.1f}",
+                'kbps': f"{kbps:.1f}",
+                'avg_size': f"{avg_size:.1f}",
+            }
+
+            # Reset window (atomic with read)
+            self._frames_window = 0
+            self._bytes_window = 0
+            self._window_start = now
+
+            return stats
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CURSES CONSOLE UI
@@ -1056,35 +1343,41 @@ class ConsoleUI:
     """
     Professional curses-based console interface.
     Matches original CockpitOS HID Manager aesthetic.
+
+    Features:
+    - Color-coded device status display
+    - Rolling log display with bounded memory (using deque)
+    - Live statistics from UDP network layer
     """
-    
+
     # Color pair IDs
     COLOR_RED    = 1
     COLOR_GREEN  = 2
     COLOR_YELLOW = 3
     COLOR_CYAN   = 4
     COLOR_DIM    = 5
-    
+
     def __init__(self, registry: DeviceRegistry, udp_network: 'UdpNetwork',
                  tx_dispatcher: TxDispatcher, rx_pollers: List[RxPoller],
-                 ui_queue: Optional[queue.Queue] = None):
+                 ui_queue: Optional[queue.Queue] = None,
+                 initial_dcs_ip: Optional[str] = None):
         self.registry = registry
         self.udp = udp_network
         self.tx_dispatcher = tx_dispatcher
         self.rx_pollers = rx_pollers
-        
+
         # Use provided queue or create new one
         self.uiq: queue.Queue = ui_queue if ui_queue is not None else queue.Queue()
         self._running = threading.Event()
-        
-        # UI state
-        self._log: List[str] = []
+
+        # UI state - use deque for O(1) bounded append (no list slicing needed)
+        self._log: Deque[str] = deque(maxlen=LOG_HISTORY_SIZE)
         self._stats = {
             'frames': '0',
             'hz': '0.0',
             'kbps': '0.0',
             'avg_size': '0.0',
-            'src': STORED_DCS_IP or '(waiting...)',
+            'src': initial_dcs_ip or '(waiting...)',
         }
     
     def post(self, event):
@@ -1140,28 +1433,27 @@ class ConsoleUI:
             
             time.sleep(0.01)
     
-    def _consume_events(self):
+    def _consume_events(self) -> None:
         """Process all pending UI events."""
         while True:
             try:
                 event = self.uiq.get_nowait()
             except queue.Empty:
                 break
-            
+
             typ, *rest = event
-            
+
             if typ == 'data_source':
                 # Event format: ('data_source', None, ip_address)
                 self._stats['src'] = rest[-1]  # Explicitly use last element
-            
+
             elif typ == 'log':
                 dev_name, msg = rest
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 line = f"[{timestamp}] [{dev_name}] {msg}"
+                # deque with maxlen auto-discards old entries - no manual slicing needed
                 self._log.append(line)
-                if len(self._log) > LOG_HISTORY_SIZE:
-                    self._log = self._log[-LOG_HISTORY_SIZE:]
-            
+
             elif typ == 'status':
                 # Status updates are pulled directly from registry
                 pass
@@ -1221,17 +1513,20 @@ class ConsoleUI:
         
         # === EVENT LOG ===
         y += 1  # Blank line separator
-        
+
         # Calculate available space for log
         log_start = y
         log_end = h - 1  # Last line is status bar
         log_lines = max(0, log_end - log_start)
-        
+
         # Show most recent log entries that fit
+        # deque doesn't support slicing, so we iterate from the end
         if log_lines > 0 and self._log:
-            visible_log = self._log[-log_lines:]
-            for i, line in enumerate(visible_log):
-                self._addstr(stdscr, log_start + i, 0, line, w, curses.A_NORMAL)
+            # Get last N entries efficiently from deque
+            log_len = len(self._log)
+            start_idx = max(0, log_len - log_lines)
+            for i, idx in enumerate(range(start_idx, log_len)):
+                self._addstr(stdscr, log_start + i, 0, self._log[idx], w, curses.A_NORMAL)
         
         # === STATUS BAR ===
         device_count = self.registry.count()
@@ -1267,74 +1562,86 @@ class ConsoleUI:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CockpitHidBridge:
-    """Main application - orchestrates all components."""
-    
-    def __init__(self, vid: int, pid: Optional[int]):
+    """
+    Main application - orchestrates all components.
+
+    Coordinates the lifecycle of all subsystems:
+    - Device registry and tracking
+    - TX dispatcher (UDP -> HID)
+    - RX pollers (HID -> UDP)
+    - Handshake management
+    - Hotplug monitoring
+    - Console UI
+    """
+
+    def __init__(self, vid: int, pid: Optional[int], dcs_ip: Optional[str] = None):
         self.vid = vid
         self.pid = pid
-        
+        self.dcs_ip = dcs_ip
+
         # Core state
         self.registry = DeviceRegistry()
         self.reconnection_tracker: Dict[str, int] = {}
-        
+
         # Poller round-robin
         self._next_poller = 0
         self._poller_lock = threading.Lock()
-        
+
         # Will be initialized in start()
+        self.ui_queue: Optional[queue.Queue] = None
         self.ui: Optional[ConsoleUI] = None
         self.tx_dispatcher: Optional[TxDispatcher] = None
         self.udp: Optional[UdpNetwork] = None
         self.handshake_mgr: Optional[HandshakeManager] = None
         self.hotplug: Optional[HotplugMonitor] = None
         self.rx_pollers: List[RxPoller] = []
-    
+
     def _get_next_poller(self) -> int:
         with self._poller_lock:
             poller_id = self._next_poller
             self._next_poller = (self._next_poller + 1) % RX_POLLERS
             return poller_id
-    
-    def start(self):
+
+    def start(self) -> None:
         """Initialize and start all components."""
         # Create shared UI queue FIRST - all components use the same queue
-        # This eliminates the placeholder/rewiring pattern for cleaner architecture
-        self.ui_queue: queue.Queue = queue.Queue()
-        
+        self.ui_queue = queue.Queue()
+
         self.rx_pollers = []
-        
+
         # TX dispatcher (with shared queue from start)
         self.tx_dispatcher = TxDispatcher(
             self.registry,
             self.ui_queue,
             num_workers=TX_WORKERS
         )
-        
-        # UDP network (with shared queue from start)
-        self.udp = UdpNetwork(self.tx_dispatcher, self.ui_queue)
-        
-        # RX pollers (with shared queue and proper callback from start)
+
+        # UDP network (with shared queue and initial DCS IP)
+        self.udp = UdpNetwork(
+            self.tx_dispatcher,
+            self.ui_queue,
+            initial_dcs_ip=self.dcs_ip
+        )
+
+        # RX pollers (with shared queue, callback set after UDP creation)
         for i in range(RX_POLLERS):
-            poller = RxPoller(
-                i, self.registry,
-                self.ui_queue,
-                on_command=lambda cmd: None  # Will be set after UDP created
-            )
+            poller = RxPoller(i, self.registry, self.ui_queue)
             self.rx_pollers.append(poller)
-        
-        # Now wire RX pollers to UDP send (UDP is created, callback is valid)
+
+        # Wire RX pollers to UDP send using the safe callback setter
         for poller in self.rx_pollers:
-            poller.on_command = self.udp.send_command
-        
+            poller.set_command_callback(self.udp.send_command)
+
         # Create UI with the same shared queue
         self.ui = ConsoleUI(
             self.registry,
             self.udp,
             self.tx_dispatcher,
             self.rx_pollers,
-            ui_queue=self.ui_queue  # Pass the shared queue
+            ui_queue=self.ui_queue,
+            initial_dcs_ip=self.dcs_ip
         )
-        
+
         # Handshake manager (with shared queue from start)
         self.handshake_mgr = HandshakeManager(
             self.registry,
@@ -1342,7 +1649,7 @@ class CockpitHidBridge:
             self._get_next_poller,
             self.tx_dispatcher.get_next_tx_worker
         )
-        
+
         # Hotplug monitor (with shared queue from start)
         self.hotplug = HotplugMonitor(
             self.vid, self.pid,
@@ -1351,39 +1658,40 @@ class CockpitHidBridge:
             self.ui_queue,
             self.reconnection_tracker
         )
-        
+
         # Start all subsystems
-        log_event(self.ui_queue, 'System', 'Starting CockpitOS HID Bridge (Scalable Edition)...')
+        log_event(self.ui_queue, 'System', 'Starting CockpitOS HID Bridge (Production Edition v3)...')
         log_event(
             self.ui_queue,
             'System',
             f'VID: 0x{self.vid:04X}, PID: {"Any" if self.pid is None else f"0x{self.pid:04X}"}',
         )
         log_event(self.ui_queue, 'System', f'Thread pool: {TX_WORKERS} TX + {RX_POLLERS} RX + 3 system')
-        
+
         self.udp.start()
         self.handshake_mgr.start()
         self.hotplug.start()
-        
+
         for poller in self.rx_pollers:
             poller.start()
-        
+
         log_event(self.ui_queue, 'System', 'All subsystems started')
     
-    def run(self):
+    def run(self) -> None:
         """Run the application (blocks until quit)."""
         self.start()
-        
+
         try:
             self.ui.run()
         finally:
             self.stop()
-    
-    def stop(self):
-        """Shutdown all components."""
-        if self.ui:
+
+    def stop(self) -> None:
+        """Shutdown all components gracefully."""
+        if self.ui_queue:
             log_event(self.ui_queue, 'System', 'Shutting down...')
-        
+
+        # Stop in reverse order of startup for clean shutdown
         if self.hotplug:
             self.hotplug.stop()
         if self.handshake_mgr:
@@ -1395,28 +1703,53 @@ class CockpitHidBridge:
         if self.udp:
             self.udp.stop()
 
+        if self.ui_queue:
+            log_event(self.ui_queue, 'System', 'Shutdown complete')
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main():
-    print("CockpitOS HID Bridge - Scalable Edition")
-    print(f"VID: 0x{USB_VID:04X}, PID: {'Any' if USB_PID is None else f'0x{USB_PID:04X}'}")
-    print(f"Architecture: {TX_WORKERS} TX workers + {RX_POLLERS} RX pollers (fixed)")
-    print(f"Logging to: {LOG_PATH}")
-    print("Starting curses interface...")
-    print()
-    
-    bridge = CockpitHidBridge(USB_VID, USB_PID)
-    
+def main() -> None:
+    """
+    Main entry point for CockpitOS HID Bridge.
+
+    Handles:
+    - Single-instance lock acquisition
+    - Settings loading
+    - Application lifecycle
+    - Clean shutdown
+    """
+    # Acquire single-instance lock (moved from module level for importability)
+    acquire_instance_lock()
+
     try:
-        bridge.run()
-    except KeyboardInterrupt:
-        pass
+        # Load settings (lazy initialization)
+        vid, pid, dcs_ip = get_settings()
+
+        print("CockpitOS HID Bridge - Production Edition v3")
+        print(f"VID: 0x{vid:04X}, PID: {'Any' if pid is None else f'0x{pid:04X}'}")
+        print(f"Architecture: {TX_WORKERS} TX workers + {RX_POLLERS} RX pollers (fixed)")
+        print(f"Logging to: {LOG_PATH}")
+        if dcs_ip:
+            print(f"Stored DCS IP: {dcs_ip}")
+        print("Starting curses interface...")
+        print()
+
+        bridge = CockpitHidBridge(vid, pid, dcs_ip)
+
+        try:
+            bridge.run()
+        except KeyboardInterrupt:
+            print("\nInterrupted by user")
+
+        print("Goodbye!")
+
     finally:
-        lock.release()
-    
-    print("Goodbye!")
+        # Always release the instance lock
+        release_instance_lock()
+
 
 if __name__ == "__main__":
     main()
