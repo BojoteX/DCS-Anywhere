@@ -218,6 +218,9 @@ HANDSHAKE_RETRY_DELAY   = 5.0    # Delay between retry attempts (seconds)
 THREAD_JOIN_TIMEOUT     = 2.0    # Timeout for thread joins (seconds)
 THREAD_JOIN_WARN        = True   # Log warning if thread doesn't join in time
 
+# Debug log rate limiting (per device)
+DEBUG_LOG_INTERVAL_S    = 2.0    # Minimum interval between debug logs per device
+
 # UI refresh
 UI_REFRESH_MS          = 50      # Console refresh interval
 
@@ -225,13 +228,15 @@ UI_REFRESH_MS          = 50      # Console refresh interval
 MAX_HID_REPORT_SIZE    = 256     # Reasonable upper bound for validation
 
 
-def extract_feature_payload(resp: List[int], expected_size: int = DEFAULT_REPORT_SIZE) -> bytes:
+def extract_feature_payload(resp: List[int], expected_size: int = DEFAULT_REPORT_SIZE,
+                            report_id: Optional[int] = None) -> bytes:
     """
     Normalize HID feature report payload (strip report ID when present).
 
     Args:
         resp: Raw HID response as list of integers
         expected_size: Expected payload size for validation
+        report_id: Expected report ID to strip (uses global setting if None)
 
     Returns:
         Extracted payload as bytes, empty bytes if invalid
@@ -248,7 +253,9 @@ def extract_feature_payload(resp: List[int], expected_size: int = DEFAULT_REPORT
     if not all(isinstance(b, int) and 0 <= b <= 255 for b in resp):
         return b""
 
-    if resp[0] == FEATURE_REPORT_ID:
+    # Use provided report_id or global default
+    rid = report_id if report_id is not None else FEATURE_REPORT_ID
+    if resp[0] == rid:
         return bytes(resp[1:])
     return bytes(resp)
 
@@ -301,8 +308,13 @@ def get_linux_usb_diagnostics() -> Dict[str, Any]:
             ][-5:]  # Last 5 USB-related warnings/errors
             if usb_errors:
                 diagnostics['recent_usb_errors'] = usb_errors
+        else:
+            # dmesg returned non-zero (permission denied or other issue)
+            diagnostics['dmesg_unavailable'] = True
+    except PermissionError:
+        diagnostics['dmesg_unavailable'] = True
     except Exception:
-        pass
+        diagnostics['dmesg_unavailable'] = True
 
     try:
         # Check USB device count
@@ -348,6 +360,8 @@ def log_usb_diagnostics(uiq: Optional[queue.Queue]) -> None:
         log_event(uiq, 'USB', "Recent USB errors in dmesg (check `dmesg | grep -i usb`):", "warning")
         for err in diag['recent_usb_errors'][:3]:
             log_event(uiq, 'USB', f"  {err.strip()[:80]}", "warning")
+    elif diag.get('dmesg_unavailable'):
+        log_event(uiq, 'USB', "Note: dmesg unavailable (requires root). USB error diagnostics skipped.", "debug")
 
 
 def get_device_usb_info(path: bytes) -> Dict[str, str]:
@@ -443,6 +457,11 @@ def get_logger() -> logging.Logger:
         return _logger
 
 
+# Per-device debug log rate limiting
+_debug_log_times: Dict[str, float] = {}
+_debug_log_lock = threading.Lock()
+
+
 def log_event(uiq: Optional[queue.Queue], name: str, msg: str, level: str = "info") -> None:
     """
     Log to file/console and enqueue for UI display.
@@ -452,7 +471,20 @@ def log_event(uiq: Optional[queue.Queue], name: str, msg: str, level: str = "inf
         name: Component/device name for log prefix
         msg: Log message
         level: Log level ('debug', 'info', 'warning', 'error', 'critical')
+
+    Note:
+        Debug-level messages are rate-limited per device to prevent log flooding
+        when many devices are failing. See DEBUG_LOG_INTERVAL_S constant.
     """
+    # Rate-limit debug messages per device
+    if level == "debug" and DEBUG_LOG_INTERVAL_S > 0:
+        now = time.monotonic()
+        with _debug_log_lock:
+            last_time = _debug_log_times.get(name, 0)
+            if now - last_time < DEBUG_LOG_INTERVAL_S:
+                return  # Throttled
+            _debug_log_times[name] = now
+
     logger = get_logger()
     log_fn = getattr(logger, level, logger.info)
     log_fn(f"[{name}] {msg}")
@@ -463,33 +495,44 @@ def log_event(uiq: Optional[queue.Queue], name: str, msg: str, level: str = "inf
             # UI queue full - log continues to file, UI display dropped
             pass
 
-def read_settings() -> Tuple[int, Optional[int], str]:
-    """Read VID, PID, and DCS IP from settings.ini"""
+def read_settings() -> Tuple[int, Optional[int], str, int]:
+    """
+    Read VID, PID, DCS IP, and report ID from settings.ini.
+
+    Returns:
+        Tuple of (vid, pid, dcs_ip, report_id)
+    """
     config = configparser.ConfigParser()
-    
+
     if not os.path.isfile(SETTINGS_PATH):
-        config['USB'] = {'VID': '0xCAFE'}
+        config['USB'] = {'VID': '0xCAFE', 'REPORT_ID': '0'}
         config['DCS'] = {'UDP_SOURCE_IP': '127.0.0.1'}
         config['MAIN'] = {'CONSOLE': '1'}
         with open(SETTINGS_PATH, 'w') as f:
             config.write(f)
-    
+
     config.read(SETTINGS_PATH)
-    
+
     try:
         vid = int(config.get('USB', 'VID', fallback='0xCAFE'), 0)
     except ValueError:
         vid = 0xCAFE
-    
+
     try:
         pid_str = config.get('USB', 'PID', fallback='')
         pid = int(pid_str, 0) if pid_str else None
     except ValueError:
         pid = None
-    
+
     dcs_ip = config.get('DCS', 'UDP_SOURCE_IP', fallback='127.0.0.1')
-    
-    return vid, pid, dcs_ip
+
+    # Report ID for HID feature reports (0 = no report ID prefix)
+    try:
+        report_id = int(config.get('USB', 'REPORT_ID', fallback='0'), 0)
+    except ValueError:
+        report_id = FEATURE_REPORT_ID
+
+    return vid, pid, dcs_ip, report_id
 
 def write_dcs_ip(ip: str):
     """Update DCS IP in settings.ini"""
@@ -525,17 +568,17 @@ def is_valid_ipv4(ip: str) -> bool:
 
 
 # Settings cache - loaded lazily on first access
-_settings_cache: Optional[Tuple[int, Optional[int], Optional[str]]] = None
+_settings_cache: Optional[Tuple[int, Optional[int], Optional[str], int]] = None
 _settings_lock = threading.Lock()
 
 
-def get_settings() -> Tuple[int, Optional[int], Optional[str]]:
+def get_settings() -> Tuple[int, Optional[int], Optional[str], int]:
     """
     Get cached settings (lazy load on first access).
     Thread-safe singleton pattern.
 
     Returns:
-        Tuple of (VID, PID, DCS_IP) where PID and DCS_IP may be None
+        Tuple of (VID, PID, DCS_IP, REPORT_ID) where PID and DCS_IP may be None
     """
     global _settings_cache
     if _settings_cache is not None:
@@ -545,18 +588,23 @@ def get_settings() -> Tuple[int, Optional[int], Optional[str]]:
         if _settings_cache is not None:
             return _settings_cache
 
-        vid, pid, dcs_ip = read_settings()
+        vid, pid, dcs_ip, report_id = read_settings()
 
         # Validate DCS IP
         if dcs_ip and not is_valid_ipv4(dcs_ip):
             get_logger().warning("Invalid DCS IP in settings.ini: %s (ignoring)", dcs_ip)
             dcs_ip = None
 
-        _settings_cache = (vid, pid, dcs_ip)
+        _settings_cache = (vid, pid, dcs_ip, report_id)
         return _settings_cache
 
 
-def reload_settings() -> Tuple[int, Optional[int], Optional[str]]:
+def get_report_id() -> int:
+    """Get the configured HID feature report ID."""
+    return get_settings()[3]
+
+
+def reload_settings() -> Tuple[int, Optional[int], Optional[str], int]:
     """Force reload settings from disk. Returns new settings."""
     global _settings_cache
     with _settings_lock:
@@ -572,20 +620,21 @@ class DeviceState:
     Thread-safe device state container.
     Uses __slots__ for memory efficiency at scale.
     """
-    
+
     __slots__ = (
         'dev', 'info', 'name', 'serial', 'path',
         'state', 'status_text', 'lock',
         'last_activity', 'packets_tx', 'packets_rx',
-        'reconnections', 'poller_id', 'tx_worker_id'
+        'reconnections', 'poller_id', 'tx_worker_id',
+        'report_id'  # HID feature report ID (configurable per-device)
     )
-    
+
     # State machine constants
     DISCONNECTED = 0
     HANDSHAKING  = 1
     READY        = 2
     ERROR        = 3
-    
+
     # Status text mapping
     STATE_TEXT = {
         DISCONNECTED: "DISCONNECTED",
@@ -593,28 +642,31 @@ class DeviceState:
         READY:        "READY",
         ERROR:        "ERROR",
     }
-    
-    def __init__(self, dev, dev_info: dict):
+
+    def __init__(self, dev, dev_info: dict, report_id: Optional[int] = None):
         self.dev = dev
         self.info = dev_info
         self.serial = dev_info.get('serial_number', '') or ''
         self.path = dev_info.get('path', b'')
-        
+
         # Derive display name (prefer serial, fallback to product)
         product = dev_info.get('product_string', '') or ''
         self.name = self.serial if self.serial else (product or f"Device-{id(dev) & 0xFFFF:04X}")
-        
+
+        # HID feature report ID (use global setting if not specified)
+        self.report_id = report_id if report_id is not None else get_report_id()
+
         # State
         self.state = self.HANDSHAKING
         self.status_text = "WAIT HANDSHAKE"
         self.lock = threading.Lock()
         self.last_activity = time.monotonic()
-        
+
         # Stats
         self.packets_tx = 0
         self.packets_rx = 0
         self.reconnections = 0
-        
+
         # Worker assignments (set by HandshakeManager after handshake)
         self.poller_id: int = -1      # RX poller assignment
         self.tx_worker_id: int = -1   # TX worker assignment (CRITICAL for single-writer)
@@ -785,12 +837,14 @@ class TxDispatcher:
             return
 
         # Pre-slice into HID reports (done once, shared immutable tuple)
+        # Report ID is configurable via settings.ini [USB] REPORT_ID
+        report_id = get_report_id()
         reports: List[bytes] = []
         offset = 0
         while offset < len(udp_data):
             chunk = udp_data[offset:offset + DEFAULT_REPORT_SIZE]
-            # Report format: [report_id=0] + [data padded to 64 bytes]
-            report = bytes([FEATURE_REPORT_ID]) + chunk.ljust(DEFAULT_REPORT_SIZE, b'\x00')
+            # Report format: [report_id] + [data padded to 64 bytes]
+            report = bytes([report_id]) + chunk.ljust(DEFAULT_REPORT_SIZE, b'\x00')
             reports.append(report)
             offset += DEFAULT_REPORT_SIZE
 
@@ -1027,10 +1081,10 @@ class RxPoller:
         for iteration in range(MAX_DRAIN_ITERATIONS):
             try:
                 resp = dev_state.dev.get_feature_report(
-                    FEATURE_REPORT_ID,
+                    dev_state.report_id,
                     DEFAULT_REPORT_SIZE + 1
                 )
-                payload = extract_feature_payload(resp)
+                payload = extract_feature_payload(resp, report_id=dev_state.report_id)
 
                 if not any(payload):
                     break
@@ -1249,12 +1303,34 @@ class HandshakeManager:
         self.retry_queue.put(dev_state)
         return True
 
-    def _clear_retry_tracker(self, dev_state: DeviceState) -> None:
-        """Clear retry tracking for a device (called on success)."""
+    def clear_retry_state(self, dev_state: DeviceState) -> None:
+        """
+        Clear retry tracking for a device.
+
+        Call this on:
+        - Successful handshake completion
+        - Device disconnection (prevents stale retries)
+        """
         key = dev_state.serial or str(dev_state.path)
         with self._retry_lock:
             if key in self._retry_tracker:
                 del self._retry_tracker[key]
+
+        # Also remove from retry queue if present (drain matching entries)
+        # This is O(n) but disconnects are rare, so acceptable
+        temp_items = []
+        try:
+            while True:
+                item = self.retry_queue.get_nowait()
+                item_key = item.serial or str(item.path)
+                if item_key != key:
+                    temp_items.append(item)
+        except queue.Empty:
+            pass
+
+        # Put back non-matching items
+        for item in temp_items:
+            self.retry_queue.put(item)
 
     def _process_handshake(self, dev_state: DeviceState, is_retry: bool) -> None:
         """Process a single device handshake."""
@@ -1283,7 +1359,7 @@ class HandshakeManager:
                 log_event(self.uiq, dev_state.name, f"Note: set_nonblocking failed ({e})", "warning")
 
             dev_state.set_state(DeviceState.READY, "READY")
-            self._clear_retry_tracker(dev_state)
+            self.clear_retry_state(dev_state)
 
             duration = time.monotonic() - handshake_start
             log_event(
@@ -1324,8 +1400,8 @@ class HandshakeManager:
 
             try:
                 with dev_state.lock:
-                    resp = dev.get_feature_report(FEATURE_REPORT_ID, DEFAULT_REPORT_SIZE + 1)
-                    payload = extract_feature_payload(resp)
+                    resp = dev.get_feature_report(dev_state.report_id, DEFAULT_REPORT_SIZE + 1)
+                    payload = extract_feature_payload(resp, report_id=dev_state.report_id)
 
                     # Empty buffer = all zeros
                     if not any(payload):
@@ -1347,6 +1423,7 @@ class HandshakeManager:
             True if handshake completed successfully, False on timeout or error.
         """
         dev = dev_state.dev
+        report_id = dev_state.report_id
         payload = HANDSHAKE_REQ.ljust(DEFAULT_REPORT_SIZE, b'\x00')
         last_error: Optional[Exception] = None
 
@@ -1357,17 +1434,17 @@ class HandshakeManager:
             try:
                 with dev_state.lock:
                     # Check if device already echoed handshake
-                    resp = dev.get_feature_report(FEATURE_REPORT_ID, DEFAULT_REPORT_SIZE + 1)
-                    data = extract_feature_payload(resp)
+                    resp = dev.get_feature_report(report_id, DEFAULT_REPORT_SIZE + 1)
+                    data = extract_feature_payload(resp, report_id=report_id)
                     if data.rstrip(b'\x00') == HANDSHAKE_REQ:
                         return True
 
                     # Send handshake request
-                    dev.send_feature_report(bytes([FEATURE_REPORT_ID]) + payload)
+                    dev.send_feature_report(bytes([report_id]) + payload)
 
                     # Check response
-                    resp = dev.get_feature_report(FEATURE_REPORT_ID, DEFAULT_REPORT_SIZE + 1)
-                    data = extract_feature_payload(resp)
+                    resp = dev.get_feature_report(report_id, DEFAULT_REPORT_SIZE + 1)
+                    data = extract_feature_payload(resp, report_id=report_id)
                     if data.rstrip(b'\x00') == HANDSHAKE_REQ:
                         return True
 
@@ -1552,6 +1629,9 @@ class HotplugMonitor:
         key = dev_state.serial or str(dev_state.path)
         if key in self._failed_devices:
             del self._failed_devices[key]
+
+        # Clear from handshake retry queue to prevent stale retries
+        self.handshake_mgr.clear_retry_state(dev_state)
 
         log_event(self.uiq, dev_state.name, "Disconnected")
         self.uiq.put(('status', dev_state.name, None))
