@@ -43,6 +43,31 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Platform detection
 IS_WINDOWS = (os.name == 'nt') or sys.platform.startswith('win')
+IS_LINUX = sys.platform.startswith('linux')
+IS_MACOS = sys.platform == 'darwin'
+
+
+def _detect_raspberry_pi() -> bool:
+    """Detect if running on Raspberry Pi hardware."""
+    if not IS_LINUX:
+        return False
+    try:
+        with open('/proc/cpuinfo', 'r') as f:
+            cpuinfo = f.read().lower()
+            return 'raspberry' in cpuinfo or 'bcm2' in cpuinfo
+    except Exception:
+        return False
+
+
+def _detect_arm_platform() -> bool:
+    """Detect if running on ARM architecture."""
+    import platform
+    machine = platform.machine().lower()
+    return 'arm' in machine or 'aarch' in machine
+
+
+IS_RASPBERRY_PI = _detect_raspberry_pi()
+IS_ARM = _detect_arm_platform()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DEPENDENCY CHECK
@@ -127,14 +152,51 @@ DEFAULT_MULTICAST_IP   = "239.255.50.10"
 DEFAULT_UDP_PORT       = 5010
 DEFAULT_DCS_TX_PORT    = 7778
 HANDSHAKE_REQ          = b"DCSBIOS-HANDSHAKE"
-FEATURE_REPORT_ID      = 0
+FEATURE_REPORT_ID      = 0       # Default HID report ID (0 = no report ID prefix)
 
-# Architecture tuning (fixed thread counts)
-TX_WORKERS             = 4       # HID write workers
-RX_POLLERS             = 4       # HID read pollers
-RX_POLL_INTERVAL_MS    = 1       # Polling interval (ms)
-MAX_DEVICES            = 256     # Registry capacity
-UDP_RX_BUFFER_SIZE     = 4 * 1024 * 1024  # 4MB kernel buffer
+# ─────────────────────────────────────────────────────────────────────────────
+# PLATFORM-SPECIFIC TUNING
+# ─────────────────────────────────────────────────────────────────────────────
+# Raspberry Pi 4 has known USB limitations:
+# - Shared USB/Ethernet bandwidth on BCM2711
+# - Limited USB power budget (~1.2A total)
+# - ARM CPU less efficient at high-frequency polling
+# - File descriptor limits can be hit with many HID devices
+#
+# These settings are auto-adjusted for Pi to improve stability at 10+ devices.
+
+if IS_RASPBERRY_PI:
+    # Raspberry Pi optimized settings
+    TX_WORKERS             = 2       # Fewer workers reduce USB contention
+    RX_POLLERS             = 2       # Fewer pollers reduce CPU load
+    RX_POLL_INTERVAL_MS    = 5       # Slower polling reduces USB bus saturation
+    HANDSHAKE_WORKERS      = 2       # Parallel handshakes prevent queue stalls
+    HANDSHAKE_STAGGER_MS   = 100     # Stagger device init to avoid USB surge
+    TX_ALL_OR_NOTHING      = True    # Drop entire frame if any queue full (consistency)
+    MAX_DEVICES            = 20      # Practical limit for Pi USB bandwidth
+    UDP_RX_BUFFER_SIZE     = 1 * 1024 * 1024  # 1MB - lower memory pressure
+elif IS_ARM:
+    # Generic ARM (not Pi) - moderate settings
+    TX_WORKERS             = 3
+    RX_POLLERS             = 3
+    RX_POLL_INTERVAL_MS    = 2
+    HANDSHAKE_WORKERS      = 2
+    HANDSHAKE_STAGGER_MS   = 50
+    TX_ALL_OR_NOTHING      = False
+    MAX_DEVICES            = 128
+    UDP_RX_BUFFER_SIZE     = 2 * 1024 * 1024
+else:
+    # Windows/Linux x86/x64 - full performance
+    TX_WORKERS             = 4       # HID write workers
+    RX_POLLERS             = 4       # HID read pollers
+    RX_POLL_INTERVAL_MS    = 1       # Polling interval (ms)
+    HANDSHAKE_WORKERS      = 3       # Parallel handshake workers
+    HANDSHAKE_STAGGER_MS   = 0       # No stagger needed on fast platforms
+    TX_ALL_OR_NOTHING      = False   # Best-effort dispatch (faster)
+    MAX_DEVICES            = 256     # Registry capacity
+    UDP_RX_BUFFER_SIZE     = 4 * 1024 * 1024  # 4MB kernel buffer
+
+# Common settings (all platforms)
 TX_QUEUE_SIZE          = 1024    # Dispatch queue depth
 LOG_HISTORY_SIZE       = 2000    # Max log lines kept
 LOG_PATH               = os.path.join(SCRIPT_DIR, "hid_manager.log")
@@ -146,6 +208,11 @@ TX_DROP_LOG_INTERVAL_S = 5.0     # Throttle log spam for TX drops
 DEVICE_OPEN_MAX_RETRIES = 3      # Max retry attempts for device open
 DEVICE_OPEN_BASE_DELAY  = 0.5    # Base delay for exponential backoff (seconds)
 DEVICE_OPEN_MAX_DELAY   = 4.0    # Maximum delay between retries (seconds)
+
+# Handshake retry configuration (for devices that fail handshake)
+HANDSHAKE_RETRY_ENABLED = True   # Enable retry for failed handshakes
+HANDSHAKE_RETRY_MAX     = 3      # Max retry attempts after initial failure
+HANDSHAKE_RETRY_DELAY   = 5.0    # Delay between retry attempts (seconds)
 
 # Thread shutdown timeouts
 THREAD_JOIN_TIMEOUT     = 2.0    # Timeout for thread joins (seconds)
@@ -184,6 +251,149 @@ def extract_feature_payload(resp: List[int], expected_size: int = DEFAULT_REPORT
     if resp[0] == FEATURE_REPORT_ID:
         return bytes(resp[1:])
     return bytes(resp)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LINUX USB DIAGNOSTICS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_linux_usb_diagnostics() -> Dict[str, Any]:
+    """
+    Gather Linux-specific USB diagnostic information.
+    Helps diagnose issues on Raspberry Pi and other Linux systems.
+
+    Returns:
+        Dictionary with USB diagnostic data, empty dict on non-Linux or errors.
+    """
+    if not IS_LINUX:
+        return {}
+
+    diagnostics: Dict[str, Any] = {}
+
+    try:
+        # Check file descriptor limits
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        diagnostics['fd_limit_soft'] = soft
+        diagnostics['fd_limit_hard'] = hard
+
+        # Count current open file descriptors
+        fd_count = len(os.listdir('/proc/self/fd'))
+        diagnostics['fd_in_use'] = fd_count
+        diagnostics['fd_remaining'] = soft - fd_count
+
+    except Exception:
+        pass
+
+    try:
+        # Check for USB power issues in dmesg (requires root or dmesg access)
+        import subprocess
+        result = subprocess.run(
+            ['dmesg', '--level=warn,err', '-T'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            usb_errors = [
+                line for line in result.stdout.split('\n')
+                if 'usb' in line.lower() and ('over-current' in line.lower() or
+                   'power' in line.lower() or 'disconnect' in line.lower() or
+                   'reset' in line.lower())
+            ][-5:]  # Last 5 USB-related warnings/errors
+            if usb_errors:
+                diagnostics['recent_usb_errors'] = usb_errors
+    except Exception:
+        pass
+
+    try:
+        # Check USB device count
+        usb_devices_path = '/sys/bus/usb/devices'
+        if os.path.exists(usb_devices_path):
+            usb_count = len([d for d in os.listdir(usb_devices_path) if d[0].isdigit()])
+            diagnostics['usb_device_count'] = usb_count
+    except Exception:
+        pass
+
+    return diagnostics
+
+
+def log_usb_diagnostics(uiq: Optional[queue.Queue]) -> None:
+    """Log USB diagnostic information for troubleshooting."""
+    if not IS_LINUX:
+        return
+
+    diag = get_linux_usb_diagnostics()
+    if not diag:
+        return
+
+    # Log platform info
+    platform_info = "Raspberry Pi" if IS_RASPBERRY_PI else ("ARM Linux" if IS_ARM else "Linux x86/x64")
+    log_event(uiq, 'USB', f"Platform: {platform_info}")
+
+    # Log FD usage
+    if 'fd_remaining' in diag:
+        if diag['fd_remaining'] < 50:
+            log_event(uiq, 'USB',
+                f"WARNING: Low file descriptors remaining ({diag['fd_remaining']}). "
+                f"Consider: ulimit -n 4096", "warning")
+        else:
+            log_event(uiq, 'USB',
+                f"File descriptors: {diag['fd_in_use']} used, {diag['fd_remaining']} remaining")
+
+    # Log USB device count
+    if 'usb_device_count' in diag:
+        log_event(uiq, 'USB', f"Total USB devices on system: {diag['usb_device_count']}")
+
+    # Log recent USB errors
+    if 'recent_usb_errors' in diag:
+        log_event(uiq, 'USB', "Recent USB errors in dmesg (check `dmesg | grep -i usb`):", "warning")
+        for err in diag['recent_usb_errors'][:3]:
+            log_event(uiq, 'USB', f"  {err.strip()[:80]}", "warning")
+
+
+def get_device_usb_info(path: bytes) -> Dict[str, str]:
+    """
+    Get detailed USB info for a device path (Linux only).
+
+    Args:
+        path: HID device path (e.g., b'/dev/hidraw0')
+
+    Returns:
+        Dictionary with USB device details.
+    """
+    info: Dict[str, str] = {}
+    if not IS_LINUX:
+        return info
+
+    try:
+        path_str = path.decode() if isinstance(path, bytes) else path
+        # Extract hidraw number
+        if 'hidraw' in path_str:
+            hidraw_num = path_str.split('hidraw')[-1]
+            sysfs_path = f'/sys/class/hidraw/hidraw{hidraw_num}/device'
+
+            # Try to get USB device path
+            if os.path.islink(sysfs_path):
+                real_path = os.path.realpath(sysfs_path)
+                info['sysfs_path'] = real_path
+
+                # Navigate up to find USB device info
+                usb_path = real_path
+                for _ in range(5):  # Walk up max 5 levels
+                    usb_path = os.path.dirname(usb_path)
+                    busnum = os.path.join(usb_path, 'busnum')
+                    devnum = os.path.join(usb_path, 'devnum')
+                    if os.path.exists(busnum) and os.path.exists(devnum):
+                        with open(busnum) as f:
+                            info['usb_bus'] = f.read().strip()
+                        with open(devnum) as f:
+                            info['usb_dev'] = f.read().strip()
+                        info['usb_address'] = f"Bus {info['usb_bus']} Device {info['usb_dev']}"
+                        break
+    except Exception:
+        pass
+
+    return info
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SETTINGS FILE HANDLING
@@ -552,15 +762,16 @@ class TxDispatcher:
             self._next_tx_worker = (self._next_tx_worker + 1) % self.num_workers
             return worker_id
     
-    def dispatch(self, udp_data: bytes):
+    def dispatch(self, udp_data: bytes) -> None:
         """
         Called by UDP RX thread - slices data and broadcasts to all workers.
-        
-        BACKPRESSURE POLICY: Best-effort all-or-nothing per frame.
-        We attempt to enqueue to all workers. If any queue is full, we handle
-        it gracefully without crashing. Partial enqueues are rare and acceptable
-        since DCS-BIOS frames overwrite state (next frame fixes any inconsistency).
-        
+
+        BACKPRESSURE POLICY (configurable via TX_ALL_OR_NOTHING):
+        - TX_ALL_OR_NOTHING=True: Drop entire frame if ANY queue is full (consistency)
+        - TX_ALL_OR_NOTHING=False: Best-effort, partial dispatch allowed (faster)
+
+        On Raspberry Pi, all-or-nothing is preferred to prevent desync across devices.
+
         Thread-safety: Exception-safe broadcast that never crashes UDP RX thread.
         """
         # Bound input size to prevent memory spikes (max ~64 reports per frame)
@@ -572,9 +783,9 @@ class TxDispatcher:
                 log_event(self.uiq, "TX", f"Dropped UDP frame (size={len(udp_data)} bytes)", "warning")
                 self._last_drop_log = now
             return
-        
+
         # Pre-slice into HID reports (done once, shared immutable tuple)
-        reports = []
+        reports: List[bytes] = []
         offset = 0
         while offset < len(udp_data):
             chunk = udp_data[offset:offset + DEFAULT_REPORT_SIZE]
@@ -582,34 +793,58 @@ class TxDispatcher:
             report = bytes([FEATURE_REPORT_ID]) + chunk.ljust(DEFAULT_REPORT_SIZE, b'\x00')
             reports.append(report)
             offset += DEFAULT_REPORT_SIZE
-        
+
         job = (tuple(reports), time.monotonic(), self._sequence)
         self._sequence += 1
-        
-        # EXCEPTION-SAFE BROADCAST
-        # Lock serializes producers; try/except handles rare consumer races
-        enqueued_count = 0
+
         with self._broadcast_lock:
-            for wq in self.worker_queues:
-                try:
-                    wq.put_nowait(job)
-                    enqueued_count += 1
-                except queue.Full:
-                    # Rare: queue filled between check iterations or due to timing
-                    # Log partial enqueue but don't crash
+            if TX_ALL_OR_NOTHING:
+                # ALL-OR-NOTHING MODE: Check capacity first, then enqueue all
+                # This prevents partial frame delivery which can cause state desync
+                can_enqueue_all = all(not wq.full() for wq in self.worker_queues)
+
+                if not can_enqueue_all:
+                    self.jobs_dropped += 1
                     now = time.monotonic()
-                    if enqueued_count > 0:
-                        self.jobs_partial += 1  # Some workers got it, some didn't
-                        if now - self._last_drop_log >= TX_DROP_LOG_INTERVAL_S:
-                            log_event(self.uiq, "TX", "Partial dispatch: some worker queues are full", "warning")
-                            self._last_drop_log = now
-                    else:
-                        self.jobs_dropped += 1  # No workers got it
-                        if now - self._last_drop_log >= TX_DROP_LOG_INTERVAL_S:
-                            log_event(self.uiq, "TX", "Dropped frame: all worker queues are full", "warning")
-                            self._last_drop_log = now
+                    if now - self._last_drop_log >= TX_DROP_LOG_INTERVAL_S:
+                        log_event(self.uiq, "TX",
+                            "Dropped frame (all-or-nothing): at least one queue full", "warning")
+                        self._last_drop_log = now
                     return
-        
+
+                # All queues have space - enqueue to all
+                for wq in self.worker_queues:
+                    try:
+                        wq.put_nowait(job)
+                    except queue.Full:
+                        # Extremely rare race - queue filled between check and put
+                        # Already committed to other queues, so this becomes partial
+                        self.jobs_partial += 1
+                        break
+
+            else:
+                # BEST-EFFORT MODE: Enqueue to as many workers as possible
+                enqueued_count = 0
+                for wq in self.worker_queues:
+                    try:
+                        wq.put_nowait(job)
+                        enqueued_count += 1
+                    except queue.Full:
+                        now = time.monotonic()
+                        if enqueued_count > 0:
+                            self.jobs_partial += 1
+                            if now - self._last_drop_log >= TX_DROP_LOG_INTERVAL_S:
+                                log_event(self.uiq, "TX",
+                                    "Partial dispatch: some worker queues full", "warning")
+                                self._last_drop_log = now
+                        else:
+                            self.jobs_dropped += 1
+                            if now - self._last_drop_log >= TX_DROP_LOG_INTERVAL_S:
+                                log_event(self.uiq, "TX",
+                                    "Dropped frame: all worker queues full", "warning")
+                                self._last_drop_log = now
+                        return
+
         self.jobs_dispatched += 1
     
     def _worker_loop(self, worker_id: int):
@@ -838,91 +1073,239 @@ class RxPoller:
 
 class HandshakeManager:
     """
-    Handles device handshakes in a dedicated thread.
-    New devices queue here after hotplug, transition to READY when complete.
+    Handles device handshakes with parallel workers and retry logic.
+
+    Features:
+    - Multiple parallel handshake workers (configurable via HANDSHAKE_WORKERS)
+    - Staggered initialization on resource-constrained platforms (Pi)
+    - Automatic retry with backoff for failed handshakes
+    - Queue monitoring with backlog warnings
     """
-    
+
     def __init__(self, registry: DeviceRegistry, ui_queue: queue.Queue,
                  get_next_poller: Callable[[], int],
-                 get_next_tx_worker: Callable[[], int]):
+                 get_next_tx_worker: Callable[[], int],
+                 num_workers: int = HANDSHAKE_WORKERS):
         self.registry = registry
         self.uiq = ui_queue
         self.get_next_poller = get_next_poller
         self.get_next_tx_worker = get_next_tx_worker
-        
+        self.num_workers = num_workers
+
+        # Queues: pending for new devices, retry for failed devices
         self.pending: queue.Queue = queue.Queue()
+        self.retry_queue: queue.Queue = queue.Queue()
+
+        # Track retry attempts: device_key -> (next_retry_time, attempt_count)
+        self._retry_tracker: Dict[str, Tuple[float, int]] = {}
+        self._retry_lock = threading.Lock()
+
+        # Stagger control for Pi
+        self._last_handshake_time = 0.0
+        self._stagger_lock = threading.Lock()
+
         self._running = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-    
+        self._workers: List[threading.Thread] = []
+        self._retry_thread: Optional[threading.Thread] = None
+
     def start(self) -> None:
         self._running.set()
-        self._thread = threading.Thread(target=self._handshake_loop, daemon=True)
-        self._thread.name = "HandshakeMgr"
-        self._thread.start()
+
+        # Start handshake workers
+        for i in range(self.num_workers):
+            t = threading.Thread(target=self._handshake_worker, args=(i,), daemon=True)
+            t.name = f"Handshake-{i}"
+            self._workers.append(t)
+            t.start()
+
+        # Start retry scheduler thread
+        if HANDSHAKE_RETRY_ENABLED:
+            self._retry_thread = threading.Thread(target=self._retry_scheduler, daemon=True)
+            self._retry_thread.name = "HandshakeRetry"
+            self._retry_thread.start()
+
+        log_event(self.uiq, "Handshake", f"Started {self.num_workers} handshake workers")
 
     def stop(self) -> None:
-        """Stop the handshake manager with proper timeout handling."""
+        """Stop all handshake workers with proper timeout handling."""
         self._running.clear()
-        if self._thread:
-            self._thread.join(timeout=THREAD_JOIN_TIMEOUT)
-            if self._thread.is_alive() and THREAD_JOIN_WARN:
-                log_event(None, "HandshakeMgr", "Handshake manager did not stop within timeout", "warning")
+
+        for t in self._workers:
+            t.join(timeout=THREAD_JOIN_TIMEOUT)
+            if t.is_alive() and THREAD_JOIN_WARN:
+                log_event(None, "HandshakeMgr", f"Worker {t.name} did not stop within timeout", "warning")
+
+        if self._retry_thread:
+            self._retry_thread.join(timeout=THREAD_JOIN_TIMEOUT)
+            if self._retry_thread.is_alive() and THREAD_JOIN_WARN:
+                log_event(None, "HandshakeMgr", "Retry scheduler did not stop within timeout", "warning")
 
     def enqueue(self, dev_state: DeviceState) -> None:
+        """Add a device to the handshake queue."""
         self.pending.put(dev_state)
-        if self.pending.qsize() > HANDSHAKE_QUEUE_WARN:
+        qsize = self.pending.qsize()
+        if qsize > HANDSHAKE_QUEUE_WARN:
             log_event(
                 self.uiq,
                 "Handshake",
-                f"High handshake backlog ({self.pending.qsize()} pending). Devices may appear idle.",
+                f"High handshake backlog ({qsize} pending). Consider parallel handshaking.",
                 "warning",
             )
-    
-    def _handshake_loop(self):
+
+    def _wait_for_stagger(self) -> None:
+        """Wait if needed to stagger device initialization (prevents USB bus surge)."""
+        if HANDSHAKE_STAGGER_MS <= 0:
+            return
+
+        with self._stagger_lock:
+            now = time.monotonic()
+            elapsed = (now - self._last_handshake_time) * 1000  # ms
+            if elapsed < HANDSHAKE_STAGGER_MS:
+                wait_time = (HANDSHAKE_STAGGER_MS - elapsed) / 1000.0
+                time.sleep(wait_time)
+            self._last_handshake_time = time.monotonic()
+
+    def _handshake_worker(self, worker_id: int) -> None:
+        """Worker thread that processes handshakes in parallel."""
         while self._running.is_set():
             try:
                 dev_state = self.pending.get(timeout=0.1)
             except queue.Empty:
                 continue
-            
-            log_event(self.uiq, dev_state.name, "Starting handshake...")
-            self.uiq.put(('status', dev_state.name, None))
-            handshake_start = time.monotonic()
-            
-            if self._do_handshake(dev_state):
-                # Clear any stale data in the Feature Report buffer
-                # This prevents old commands from being sent to DCS on reconnection
-                if not self._clear_backlog(dev_state):
-                    dev_state.set_state(DeviceState.ERROR, "BACKLOG CLEAR FAILED")
-                    log_event(self.uiq, dev_state.name, "Failed to clear backlog", "error")
-                    self.uiq.put(('status', dev_state.name, None))
-                    continue
-                
-                # Assign to workers (CRITICAL: must happen before READY state)
-                dev_state.poller_id = self.get_next_poller()
-                dev_state.tx_worker_id = self.get_next_tx_worker()  # Single-writer assignment
-                
-                # Enable non-blocking mode BEFORE setting READY (proper ordering)
+
+            # Stagger on Pi to avoid USB bus saturation
+            self._wait_for_stagger()
+
+            self._process_handshake(dev_state, is_retry=False)
+
+    def _retry_scheduler(self) -> None:
+        """Background thread that re-enqueues failed devices for retry."""
+        while self._running.is_set():
+            time.sleep(1.0)  # Check every second
+
+            if not HANDSHAKE_RETRY_ENABLED:
+                continue
+
+            now = time.monotonic()
+            devices_to_retry: List[DeviceState] = []
+
+            # Check retry queue for devices ready to retry
+            while True:
                 try:
-                    dev_state.dev.set_nonblocking(1)
-                except Exception as e:
-                    log_event(self.uiq, dev_state.name, f"Note: set_nonblocking failed ({e})", "warning")
-                    # Continue anyway - polling will still work
-                
-                dev_state.set_state(DeviceState.READY, "READY")
-                
-                duration = time.monotonic() - handshake_start
-                log_event(
-                    self.uiq,
-                    dev_state.name,
-                    f"Handshake complete, ready to process input. ({duration:.2f}s)",
-                )
+                    dev_state = self.retry_queue.get_nowait()
+
+                    key = dev_state.serial or str(dev_state.path)
+                    with self._retry_lock:
+                        if key in self._retry_tracker:
+                            next_retry, attempts = self._retry_tracker[key]
+                            if now >= next_retry:
+                                devices_to_retry.append(dev_state)
+                            else:
+                                # Not ready yet, put back
+                                self.retry_queue.put(dev_state)
+                        else:
+                            # No retry info, skip
+                            pass
+                except queue.Empty:
+                    break
+
+            # Re-enqueue devices ready for retry
+            for dev_state in devices_to_retry:
+                key = dev_state.serial or str(dev_state.path)
+                with self._retry_lock:
+                    _, attempts = self._retry_tracker.get(key, (0, 0))
+                log_event(self.uiq, dev_state.name,
+                    f"Retrying handshake (attempt {attempts + 1}/{HANDSHAKE_RETRY_MAX + 1})")
+                self.pending.put(dev_state)
+
+    def _schedule_retry(self, dev_state: DeviceState) -> bool:
+        """
+        Schedule a device for retry after handshake failure.
+        Returns True if retry scheduled, False if max retries exceeded.
+        """
+        if not HANDSHAKE_RETRY_ENABLED:
+            return False
+
+        key = dev_state.serial or str(dev_state.path)
+        now = time.monotonic()
+
+        with self._retry_lock:
+            if key in self._retry_tracker:
+                _, attempts = self._retry_tracker[key]
+                attempts += 1
+            else:
+                attempts = 1
+
+            if attempts > HANDSHAKE_RETRY_MAX:
+                # Max retries exceeded
+                if key in self._retry_tracker:
+                    del self._retry_tracker[key]
+                return False
+
+            # Schedule retry
+            next_retry = now + HANDSHAKE_RETRY_DELAY
+            self._retry_tracker[key] = (next_retry, attempts)
+
+        self.retry_queue.put(dev_state)
+        return True
+
+    def _clear_retry_tracker(self, dev_state: DeviceState) -> None:
+        """Clear retry tracking for a device (called on success)."""
+        key = dev_state.serial or str(dev_state.path)
+        with self._retry_lock:
+            if key in self._retry_tracker:
+                del self._retry_tracker[key]
+
+    def _process_handshake(self, dev_state: DeviceState, is_retry: bool) -> None:
+        """Process a single device handshake."""
+        log_event(self.uiq, dev_state.name,
+            "Starting handshake..." + (" (retry)" if is_retry else ""))
+        self.uiq.put(('status', dev_state.name, None))
+        handshake_start = time.monotonic()
+
+        if self._do_handshake(dev_state):
+            # Clear any stale data in the Feature Report buffer
+            if not self._clear_backlog(dev_state):
+                dev_state.set_state(DeviceState.ERROR, "BACKLOG CLEAR FAILED")
+                log_event(self.uiq, dev_state.name, "Failed to clear backlog", "error")
                 self.uiq.put(('status', dev_state.name, None))
+                self._schedule_retry(dev_state)
+                return
+
+            # Assign to workers (CRITICAL: must happen before READY state)
+            dev_state.poller_id = self.get_next_poller()
+            dev_state.tx_worker_id = self.get_next_tx_worker()
+
+            # Enable non-blocking mode BEFORE setting READY
+            try:
+                dev_state.dev.set_nonblocking(1)
+            except Exception as e:
+                log_event(self.uiq, dev_state.name, f"Note: set_nonblocking failed ({e})", "warning")
+
+            dev_state.set_state(DeviceState.READY, "READY")
+            self._clear_retry_tracker(dev_state)
+
+            duration = time.monotonic() - handshake_start
+            log_event(
+                self.uiq,
+                dev_state.name,
+                f"Handshake complete, ready ({duration:.2f}s)",
+            )
+            self.uiq.put(('status', dev_state.name, None))
+        else:
+            duration = time.monotonic() - handshake_start
+
+            # Try to schedule retry
+            if self._schedule_retry(dev_state):
+                dev_state.set_state(DeviceState.ERROR, "HANDSHAKE FAILED (WILL RETRY)")
+                log_event(self.uiq, dev_state.name,
+                    f"Handshake failed ({duration:.2f}s), will retry in {HANDSHAKE_RETRY_DELAY}s", "warning")
             else:
                 dev_state.set_state(DeviceState.ERROR, "HANDSHAKE FAILED")
-                duration = time.monotonic() - handshake_start
-                log_event(self.uiq, dev_state.name, f"Handshake failed ({duration:.2f}s)", "error")
-                self.uiq.put(('status', dev_state.name, None))
+                log_event(self.uiq, dev_state.name,
+                    f"Handshake failed ({duration:.2f}s), max retries exceeded", "error")
+
+            self.uiq.put(('status', dev_state.name, None))
     
     def _clear_backlog(self, dev_state: DeviceState) -> bool:
         """
@@ -1661,12 +2044,27 @@ class CockpitHidBridge:
 
         # Start all subsystems
         log_event(self.ui_queue, 'System', 'Starting CockpitOS HID Bridge (Production Edition v3)...')
+
+        # Log platform info
+        platform_name = "Raspberry Pi" if IS_RASPBERRY_PI else ("ARM" if IS_ARM else "x86/x64")
+        log_event(self.ui_queue, 'System', f'Platform: {platform_name} ({sys.platform})')
+
         log_event(
             self.ui_queue,
             'System',
             f'VID: 0x{self.vid:04X}, PID: {"Any" if self.pid is None else f"0x{self.pid:04X}"}',
         )
-        log_event(self.ui_queue, 'System', f'Thread pool: {TX_WORKERS} TX + {RX_POLLERS} RX + 3 system')
+        log_event(self.ui_queue, 'System',
+            f'Thread pool: {TX_WORKERS} TX + {RX_POLLERS} RX + {HANDSHAKE_WORKERS} HS workers')
+
+        # Log Pi-specific tuning if applicable
+        if IS_RASPBERRY_PI:
+            log_event(self.ui_queue, 'System',
+                f'Pi tuning: poll={RX_POLL_INTERVAL_MS}ms, stagger={HANDSHAKE_STAGGER_MS}ms, '
+                f'all-or-nothing={TX_ALL_OR_NOTHING}')
+
+        # Log USB diagnostics on Linux
+        log_usb_diagnostics(self.ui_queue)
 
         self.udp.start()
         self.handshake_mgr.start()
